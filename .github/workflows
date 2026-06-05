@@ -1,0 +1,206 @@
+# Werify Deploy Gate — Reusable GitHub Actions Workflow
+#
+# Stops any CI/CD pipeline mid-run and requires a code owner to sign
+# with their hardware passkey. The signature is cryptographically bound
+# to the exact commit SHA, target environment, and timestamp.
+#
+# ── CUSTOMER USAGE ───────────────────────────────────────────────────────────
+#
+# 1. Add secrets to your repo:
+#    WERIFY_API_KEY       — from werify.ai dashboard (Settings → Deploy Gate)
+#    WERIFY_OWNER_EMAIL   — Werify account of the authorized code owner
+#
+# 2. Copy this file to your repo as .github/workflows/werify-deploy-gate.yml
+#
+# 3. Call it from your deploy workflow:
+#
+#   jobs:
+#     gate:
+#       uses: org/repo/.github/workflows/werify-deploy-gate.yml@main
+#       with:
+#         environment: production
+#       secrets:
+#         WERIFY_API_KEY:     ${{ secrets.WERIFY_API_KEY }}
+#         WERIFY_OWNER_EMAIL: ${{ secrets.WERIFY_OWNER_EMAIL }}
+#
+#     deploy:
+#       needs: gate
+#       if: needs.gate.outputs.approved == 'true'
+#       steps:
+#         - run: ./deploy.sh
+#           # proof available as: needs.gate.outputs.proof_json
+#
+# ── HOW IT WORKS ─────────────────────────────────────────────────────────────
+#
+# Challenge = SHA-256(commit_sha | target_env | expires_at | request_id)
+# The code owner's passkey signs this challenge. Because the challenge
+# binds the exact commit SHA and target environment, the signature
+# mathematically proves a human approved THIS commit to THIS environment.
+# Replay attacks are blocked by WebAuthn sign-count.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Werify Deploy Gate
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target deployment environment (e.g. production, staging)'
+        required: true
+        type: string
+      werify_api_url:
+        description: 'Override Werify API base URL (default: https://werify.ai)'
+        required: false
+        type: string
+        default: 'https://werify.ai'
+      timeout_minutes:
+        description: 'Max minutes to wait for human approval (default: 30)'
+        required: false
+        type: number
+        default: 30
+
+    secrets:
+      WERIFY_API_KEY:
+        description: 'Deploy Gate API key from werify.ai dashboard'
+        required: true
+      WERIFY_OWNER_EMAIL:
+        description: 'Werify account email of the authorized code owner'
+        required: true
+
+    outputs:
+      proof_json:
+        description: 'Werify proof JSON (present when approved)'
+        value: ${{ jobs.gate.outputs.proof_json }}
+      approved:
+        description: '"true" if the deploy was approved, "false" otherwise'
+        value: ${{ jobs.gate.outputs.approved }}
+
+jobs:
+  gate:
+    name: Werify Human Sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+
+    outputs:
+      proof_json: ${{ steps.poll.outputs.proof_json }}
+      approved:   ${{ steps.poll.outputs.approved }}
+
+    steps:
+      - name: Request Human Approval
+        id: request
+        env:
+          WERIFY_API_URL: ${{ inputs.werify_api_url }}
+          WERIFY_API_KEY: ${{ secrets.WERIFY_API_KEY }}
+          OWNER_EMAIL:    ${{ secrets.WERIFY_OWNER_EMAIL }}
+          TARGET_ENV:     ${{ inputs.environment }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg api_key     "$WERIFY_API_KEY" \
+            --arg repo        "$GITHUB_REPOSITORY" \
+            --arg commit_sha  "$GITHUB_SHA" \
+            --arg target_env  "$TARGET_ENV" \
+            --arg owner_email "$OWNER_EMAIL" \
+            --arg requester   "github-actions/$GITHUB_WORKFLOW" \
+            --arg branch      "$GITHUB_REF_NAME" \
+            --arg pr_number   "${{ github.event.pull_request.number }}" \
+            '{
+              api_key:      $api_key,
+              repo:         $repo,
+              commit_sha:   $commit_sha,
+              target_env:   $target_env,
+              owner_email:  $owner_email,
+              requester:    $requester,
+              branch:       $branch,
+              pr_number:    (if $pr_number == "" then null else $pr_number end)
+            }')
+
+          RESP=$(curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$WERIFY_API_URL/approve/api/deploy-request.php")
+
+          echo "Response: $RESP"
+
+          REQUEST_ID=$(echo "$RESP" | jq -r '.request_id // empty')
+          TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+          APPROVE_URL=$(echo "$RESP" | jq -r '.approve_url // empty')
+          HAS_PASSKEY=$(echo "$RESP" | jq -r '.has_passkey // false')
+
+          if [ -z "$REQUEST_ID" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Failed to create deploy request. Response: $RESP"
+            exit 1
+          fi
+
+          echo "request_id=$REQUEST_ID" >> $GITHUB_OUTPUT
+          echo "token=$TOKEN"           >> $GITHUB_OUTPUT
+
+          # Print the approve URL as a prominent notice so it appears in the
+          # Actions summary and can be clicked directly from the workflow run.
+          echo "::notice title=🔐 Werify Deploy Gate — Action Required::$APPROVE_URL"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  DEPLOY GATE: Human sign-off required"
+          echo "  Environment: $TARGET_ENV"
+          echo "  Commit:      ${GITHUB_SHA:0:7}"
+          echo "  Has passkey: $HAS_PASSKEY"
+          echo ""
+          echo "  Approve URL: $APPROVE_URL"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ "$HAS_PASSKEY" = "false" ]; then
+            echo "::warning::Code owner has no passkey registered. They can still approve with TOTP, but passkey is recommended."
+          fi
+
+      - name: Poll for Approval
+        id: poll
+        env:
+          WERIFY_API_URL: ${{ inputs.werify_api_url }}
+          REQUEST_ID:     ${{ steps.request.outputs.request_id }}
+          TOKEN:          ${{ steps.request.outputs.token }}
+          TIMEOUT_MINS:   ${{ inputs.timeout_minutes }}
+        run: |
+          # Poll every 30s. Each iteration consumes 30s, so max iterations
+          # = timeout_minutes * 2. Default 30 min = 60 iterations.
+          TIMEOUT_SECS=$(( TIMEOUT_MINS * 60 ))
+          MAX_ITER=$(( TIMEOUT_SECS / 30 ))
+          ELAPSED=0
+
+          for i in $(seq 1 $MAX_ITER); do
+            sleep 30
+            ELAPSED=$(( ELAPSED + 30 ))
+
+            RESP=$(curl -sf \
+              "$WERIFY_API_URL/approve/api/deploy-status.php?id=$REQUEST_ID&token=$TOKEN" \
+              || echo '{"status":"error"}')
+
+            STATUS=$(echo "$RESP" | jq -r '.status // "error"')
+            MINS_LEFT=$(( (TIMEOUT_SECS - ELAPSED) / 60 ))
+
+            echo "[${i}/${MAX_ITER}] Status: $STATUS (${MINS_LEFT}m remaining)"
+
+            case "$STATUS" in
+              approved)
+                PROOF=$(echo "$RESP" | jq -c '.proof_json // {}')
+                echo "proof_json=$PROOF" >> $GITHUB_OUTPUT
+                echo "approved=true"     >> $GITHUB_OUTPUT
+                echo ""
+                echo "✓ Deploy authorized by human passkey signature."
+                exit 0
+                ;;
+              rejected)
+                echo "approved=false" >> $GITHUB_OUTPUT
+                echo "::error::Deploy rejected by code owner."
+                exit 1
+                ;;
+              expired)
+                echo "approved=false" >> $GITHUB_OUTPUT
+                echo "::error::Deploy gate expired without human approval."
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "approved=false" >> $GITHUB_OUTPUT
+          echo "::error::Timed out waiting for human approval after ${TIMEOUT_MINS} minutes."
+          exit 1
